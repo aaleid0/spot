@@ -37,18 +37,12 @@ from bosdyn.api.geometry_pb2 import SE2Velocity, SE2VelocityLimit, Vec2
 from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
 from scipy.spatial.transform import Rotation as R
 import numpy as np
-import torch
 import os
 import random
 import threading
-# yolo v8
-import PIL.Image
 import cv2
-import PIL
-import torch 
 import numpy as np
 
-from ultralytics import YOLO
 import rospy
 
 from sensor_msgs.msg import Image
@@ -56,21 +50,28 @@ from cv_bridge import CvBridge, CvBridgeError
 from vision_msgs.msg import Detection2DArray, Detection2D, BoundingBox2D, ObjectHypothesisWithPose
 import tf2_ros
 
-# Import the YOLOv7+SAM2 immediate detector by absolute path so the catkin
-# devel-space wrapper scripts can never shadow it
-import os
-import importlib.util
-spec = importlib.util.spec_from_file_location("yolov7_sam2_node", os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov7_sam2_node.py"))
-yolov7_sam2_node = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(yolov7_sam2_node)
-YOLOv7 = yolov7_sam2_node.YOLOv7SAM2ImmediateDetector
+
+def load_yolov7_detector():
+    """Load the YOLOv7+SAM2 detector only when that mode is selected."""
+    import importlib.util
+
+    detector_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov7_sam2_node.py")
+    spec = importlib.util.spec_from_file_location("yolov7_sam2_node", detector_path)
+    yolov7_sam2_node = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(yolov7_sam2_node)
+    return yolov7_sam2_node.YOLOv7SAM2ImmediateDetector
 
 class yolo_seg:
     def __init__(self):
+        import torch
+        from PIL import Image as PILImage
+        from ultralytics import YOLO
+
         # self.w_org = 1280
         # self.h_org = 720
         self.w_org = None
         self.h_org = None
+        self.pil_image = PILImage
         ## new - add the GPU as the device
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         print(f"Yolo device: {self.device}")
@@ -92,7 +93,7 @@ class yolo_seg:
         for i, r in enumerate(results):
             # Plot results image
             im_bgr = r.plot()  # BGR-order numpy array
-            im_rgb = PIL.Image.fromarray(im_bgr[..., ::-1])  # RGB-order PIL image  
+            im_rgb = self.pil_image.fromarray(im_bgr[..., ::-1])  # RGB-order PIL image
 
             # Show results to screen (in supported environments)
             r.show()
@@ -147,13 +148,13 @@ class yolo_seg:
                 mask_base = np.where(mask_base + mask > 0, 1, 0)
                 mask = mask * 255
                 # import pdb; pdb.set_trace()
-                mask = PIL.Image.fromarray(mask)
+                mask = self.pil_image.fromarray(mask)
                 mask = self.bridge.cv2_to_imgmsg(np.array(mask), encoding="mono8")
                 detection.source_img = mask
                 detection_array.detections.append(detection)
             
             mask_base = (mask_base * 255).astype(np.uint8)
-            mask_base = PIL.Image.fromarray(mask_base)
+            mask_base = self.pil_image.fromarray(mask_base)
             mask_base_msg = self.bridge.cv2_to_imgmsg(np.array(mask_base), encoding="mono8")
             self.yolo_mask_pub.publish(mask_base_msg)
             
@@ -232,20 +233,30 @@ class spotMoveBase:
         # goal mode flag
         self.goal_mode = "subscribe"
 
-        # detection model: "yolov8" (YOLOv8-seg only), "yolov7-sam2"
-        # (YOLOv7+SAM2 only), or "v7+v8" (both simultaneously).
+        # detection model: "none", "yolov8" (YOLOv8-seg only),
+        # "yolov7-sam2" (YOLOv7+SAM2 only), or "v7+v8" (both simultaneously).
         # Switch at launch time: rosrun spot spot_base.py _detection_model:=yolov8
         self.detection_model = rospy.get_param("~detection_model", "yolov7-sam2")
-        if self.detection_model not in ("yolov8", "yolov7-sam2", "v7+v8"):
+        if self.detection_model not in ("none", "yolov8", "yolov7-sam2", "v7+v8"):
             rospy.logwarn(f"Unknown detection_model '{self.detection_model}', falling back to yolov7-sam2")
             self.detection_model = "yolov7-sam2"
+
+        # control mode: "all" accepts teleop, RViz, and planner commands;
+        # "teleop_only" disables both navigation goal inputs.
+        self.control_mode = rospy.get_param("~control_mode", "all")
+        if self.control_mode not in ("all", "teleop_only"):
+            rospy.logwarn(f"Unknown control_mode '{self.control_mode}', falling back to all")
+            self.control_mode = "all"
+        rospy.loginfo(f"Spot modes: detection_model={self.detection_model}, control_mode={self.control_mode}")
 
         # ROS
         self.tf_broadcaster = tf2_ros.TransformBroadcaster()
         self.goal = [0., 0., 0.] # x,y,yaw
-        # rospy.Subscriber("/navigation_SPOT/waypoints", PoseStamped, self.goal_pose_sub_callback)
-        rospy.Subscriber("/spot/waypoint", PoseStamped, self.goal_pose_sub_callback)
-        rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.goal_pose_click_callback)
+        if self.control_mode == "all":
+            rospy.Subscriber("/spot/waypoint", PoseStamped, self.goal_pose_sub_callback)
+            rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.goal_pose_click_callback)
+        else:
+            rospy.loginfo("Teleop-only mode: RViz and autonomous waypoint inputs are disabled")
         self.pose_pub = rospy.Publisher('/spot/pose', PoseStamped, queue_size=10)
         self.odom_pub = rospy.Publisher('/spot/odom', Odometry, queue_size=10)
         self.img_pub = rospy.Publisher('/spot_image', Image, queue_size=10)
@@ -269,16 +280,20 @@ class spotMoveBase:
         rospy.Timer(rospy.Duration(0.05), self.move_status_check_timer_callback)
 
         # Initialize detectors with detection_model parameter for topic routing
-        if self.detection_model == "yolov8":
+        if self.detection_model == "none":
+            rospy.loginfo("Detection disabled; camera images will still be published on /spot_image")
+        elif self.detection_model == "yolov8":
             self.yolo = yolo_seg()
             rospy.loginfo("Initialized YOLOv8 detector only")
         elif self.detection_model == "yolov7-sam2":
             # SAM2 instance
+            YOLOv7 = load_yolov7_detector()
             self.yolov7_sam2_detector = YOLOv7(detection_model=self.detection_model)
             rospy.loginfo("Initialized YOLOv7+SAM2 detector only")
         elif self.detection_model == "v7+v8":
             # Initialize both detectors for parallel operation with shared topic routing
             self.yolo = yolo_seg()
+            YOLOv7 = load_yolov7_detector()
             self.yolov7_sam2_detector = YOLOv7(detection_model=self.detection_model)
             rospy.loginfo("Both detectors will publish to /yolo/detection for unified detection stream")
 
